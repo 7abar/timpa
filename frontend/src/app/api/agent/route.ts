@@ -96,7 +96,7 @@ async function handler(req: NextRequest, endpoint: 'run' | 'proactive') {
     .from('channels')
     .select(`
       id, provider, model, system_prompt, rate_eth_per_min, creator_id,
-      encrypted_api_key
+      encrypted_api_key, agent_config
     `)
     .eq('id', channelId)
     .eq('is_active', true)
@@ -115,14 +115,28 @@ async function handler(req: NextRequest, endpoint: 'run' | 'proactive') {
     return NextResponse.json({ error: 'Could not decrypt API key' }, { status: 500 })
   }
 
+  // Resolve agent config — stored as JSON in channel.agent_config column
+  // Falls back to safe defaults if column is null or missing
+  const { DEFAULT_AGENT_CONFIG } = await import('@/types')
+  const agentCfg = {
+    ...DEFAULT_AGENT_CONFIG,
+    ...(channel.agent_config ?? {}),
+  }
+
   // Forward to agent runner
   const runnerBody = {
-    channel_id: channelId,
-    creator_api_key: decrypted,          // never logged, passed direct to runner
-    system_prompt: channel.system_prompt,
-    model: channel.model,
-    provider: channel.provider,
+    channel_id:           channelId,
+    creator_api_key:      decrypted,        // never logged, passed direct to runner
+    system_prompt:        channel.system_prompt,
+    model:                channel.model,
+    provider:             channel.provider,
     conversation_history: conversationHistory.slice(-10),
+    // Per-channel LLM tuning
+    temperature:          agentCfg.temperature,
+    max_tokens:           agentCfg.maxTokens,
+    no_emoji:             agentCfg.noEmoji,
+    proactive_interval_min: agentCfg.proactiveIntervalMin,
+    proactive_interval_max: agentCfg.proactiveIntervalMax,
     ...(endpoint === 'run' && userMessage ? { user_message: userMessage } : {}),
   }
 

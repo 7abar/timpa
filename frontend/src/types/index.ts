@@ -53,6 +53,7 @@ export interface Channel {
   system_prompt: string
   encrypted_api_key: string       // never expose plaintext to client
   personality_template: string | null
+  agent_config: AgentConfig        // LLM tuning (temperature, maxTokens, noEmoji…)
   rate_eth_per_min: number
   is_active: boolean
   total_subscribers: number
@@ -133,6 +134,7 @@ export interface CreateChannelForm {
   systemPrompt: string
   personalityTemplate: string | null
   rateEthPerMin: number
+  agentConfig: AgentConfig
 }
 
 export interface UpdateChannelForm {
@@ -157,6 +159,26 @@ export interface SignInForm {
 }
 
 // ============================================================
+// AGENT CONFIG — per-channel LLM tuning
+// ============================================================
+
+export interface AgentConfig {
+  temperature: number       // 0.0 – 1.0
+  maxTokens: number         // max tokens per response
+  noEmoji: boolean          // strip emoji from output
+  proactiveIntervalMin: number  // seconds (min of jitter range)
+  proactiveIntervalMax: number  // seconds (max of jitter range)
+}
+
+export const DEFAULT_AGENT_CONFIG: AgentConfig = {
+  temperature: 0.85,
+  maxTokens: 256,
+  noEmoji: false,
+  proactiveIntervalMin: 5,
+  proactiveIntervalMax: 10,
+}
+
+// ============================================================
 // PERSONALITY TEMPLATES
 // ============================================================
 
@@ -169,6 +191,7 @@ export interface PersonalityTemplate {
   suggestedProvider: LLMProvider
   suggestedModel: string
   description: string
+  agentConfig?: Partial<AgentConfig>  // optional overrides from template
 }
 
 // ============================================================
@@ -215,6 +238,10 @@ export interface AgentRunnerRequest {
   model: string
   provider: string
   conversation_history?: Array<{ role: string; content: string }>
+  // Per-channel LLM tuning
+  temperature?: number
+  max_tokens?: number
+  no_emoji?: boolean
 }
 
 export interface AgentRunnerResponse {

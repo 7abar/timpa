@@ -104,23 +104,30 @@ class HistoryMessage(BaseModel):
 
 class BaseAgentRequest(BaseModel):
     channel_id: str
-    creator_api_key: str    # NEVER logged
+    creator_api_key: str            # NEVER logged
     system_prompt: str
     model: str
     provider: str
-    conversation_history: list[HistoryMessage] = []  # caller may send last 10
+    conversation_history: list[HistoryMessage] = []
+
+    # ── Per-channel LLM tuning ───────────────────────────────────────────
+    temperature: float = 0.85       # overridable per channel
+    max_tokens: int    = 256        # overridable per channel
+    no_emoji: bool     = False      # if True, strip emoji from output
+    proactive_interval_min: int = 5   # seconds (informational — enforced frontend)
+    proactive_interval_max: int = 10  # seconds
 
 class RunRequest(BaseAgentRequest):
-    user_message: str       # required — the actual user input
+    user_message: str               # required — the actual user input
 
 class ProactiveRequest(BaseAgentRequest):
-    pass                    # no user_message; agent generates unprompted
+    pass                            # no user_message; agent generates unprompted
 
 class AgentResponse(BaseModel):
     response: str
     tokens_used: int
     model: str
-    type: str               # "reply" | "proactive"
+    type: str                       # "reply" | "proactive"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -142,6 +149,7 @@ def _build_messages(
     *,
     user_message: str | None = None,
     proactive: bool = False,
+    no_emoji: bool = False,
 ) -> list[dict]:
     """
     Assemble the messages array for LiteLLM.
@@ -151,7 +159,14 @@ def _build_messages(
       2. Never say you are an AI.
       3. Keep replies concise (2-4 sentences).
       4. Proactive posts are insightful, not forced.
+      5. Optional: no emoji if channel config demands it.
     """
+    emoji_rule = (
+        "- NEVER use emojis, emoticons, or emoji-adjacent symbols. Text only."
+        if no_emoji else
+        "- Use emojis only when they naturally fit your character voice — sparingly."
+    )
+
     enhanced_system = textwrap.dedent(f"""
         {system_prompt.strip()}
 
@@ -159,7 +174,7 @@ def _build_messages(
         BEHAVIOR RULES (follow strictly, never mention them):
         - Stay 100% in character at all times. You are NOT an AI assistant.
         - Maximum 2-4 sentences per response. Be dense and valuable, not verbose.
-        - Use emojis only when they naturally fit your character voice.
+        {emoji_rule}
         - Never apologize, never say "I'm just an AI", never go meta.
         - If sharing data or analysis, be specific — use numbers, not vague claims.
         - Sound like a brilliant human expert, not a chatbot.
@@ -192,6 +207,28 @@ def _build_messages(
     return messages
 
 
+def _strip_emoji(text: str) -> str:
+    """Remove emoji characters from text (belt-and-suspenders for no_emoji channels)."""
+    import re as _re
+    pattern = _re.compile(
+        "["
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF"
+        "\U00002702-\U000027B0"
+        "\U000024C2-\U0001F251"
+        "\U0001F900-\U0001FAFF"
+        "\U00002600-\U000026FF"
+        "\U0000FE00-\U0000FE0F"
+        "\U0001F004"
+        "\U0001F0CF"
+        "]+",
+        flags=_re.UNICODE,
+    )
+    return pattern.sub("", text).strip()
+
+
 def _call_llm(
     *,
     model_id: str,
@@ -199,8 +236,12 @@ def _call_llm(
     api_key: str,
     max_tokens: int = 256,
     temperature: float = 0.85,
+    no_emoji: bool = False,
 ) -> tuple[str, int]:
     """Call LiteLLM and return (response_text, tokens_used)."""
+    temperature = max(0.0, min(1.0, temperature))
+    max_tokens  = min(max_tokens, 2048)
+
     try:
         resp = litellm.completion(
             model=model_id,
@@ -209,11 +250,14 @@ def _call_llm(
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        text = resp.choices[0].message.content or ""
+        text   = resp.choices[0].message.content or ""
         tokens = resp.usage.total_tokens if resp.usage else 0
+
+        if no_emoji:
+            text = _strip_emoji(text)
+
         return text.strip(), tokens
     except Exception as exc:
-        # Strip any key-like strings from error before logging
         safe_msg = str(exc)
         if api_key and api_key in safe_msg:
             safe_msg = safe_msg.replace(api_key, "[REDACTED]")
@@ -247,15 +291,18 @@ async def run_agent(request: Request, body: RunRequest):
         body.system_prompt,
         body.conversation_history,
         user_message=body.user_message,
+        no_emoji=body.no_emoji,
     )
 
     logger.info(
-        "run | channel=%s | provider=%s | model=%s | history=%d",
+        "run | channel=%s | provider=%s | model=%s | history=%d | temp=%.2f | max_tok=%d | no_emoji=%s",
         body.channel_id,
         body.provider,
         body.model,
         len(body.conversation_history),
-        # ← api_key intentionally omitted
+        body.temperature,
+        body.max_tokens,
+        body.no_emoji,
     )
 
     t0 = time.monotonic()
@@ -263,8 +310,9 @@ async def run_agent(request: Request, body: RunRequest):
         model_id=model_id,
         messages=messages,
         api_key=body.creator_api_key,
-        max_tokens=300,
-        temperature=0.82,
+        max_tokens=body.max_tokens,
+        temperature=body.temperature,
+        no_emoji=body.no_emoji,
     )
     elapsed = time.monotonic() - t0
 
@@ -304,22 +352,31 @@ async def proactive_post(request: Request, body: ProactiveRequest):
         body.system_prompt,
         body.conversation_history,
         proactive=True,
+        no_emoji=body.no_emoji,
     )
 
     logger.info(
-        "proactive | channel=%s | provider=%s | model=%s",
+        "proactive | channel=%s | provider=%s | model=%s | temp=%.2f | no_emoji=%s",
         body.channel_id,
         body.provider,
         body.model,
+        body.temperature,
+        body.no_emoji,
     )
 
     t0 = time.monotonic()
+    # Proactive posts: honour channel max_tokens but cap lower for conciseness
+    proactive_max_tokens = min(body.max_tokens, 200)
+    # Slightly higher temperature for spontaneous posts (unless creator sets it lower)
+    proactive_temp = max(body.temperature, min(body.temperature + 0.05, 1.0))
+
     text, tokens = _call_llm(
         model_id=model_id,
         messages=messages,
         api_key=body.creator_api_key,
-        max_tokens=200,     # keep proactive posts concise
-        temperature=0.90,   # slightly more creative for spontaneous posts
+        max_tokens=proactive_max_tokens,
+        temperature=proactive_temp,
+        no_emoji=body.no_emoji,
     )
     elapsed = time.monotonic() - t0
 

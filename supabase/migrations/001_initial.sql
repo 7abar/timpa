@@ -36,6 +36,14 @@ CREATE TABLE IF NOT EXISTS public.channels (
   system_prompt        TEXT NOT NULL DEFAULT '',
   encrypted_api_key    TEXT NOT NULL,                        -- pgcrypto encrypted
   personality_template TEXT,
+  -- Per-channel LLM tuning: { temperature, maxTokens, noEmoji, proactiveIntervalMin, proactiveIntervalMax }
+  agent_config JSONB NOT NULL DEFAULT '{
+    "temperature": 0.85,
+    "maxTokens": 256,
+    "noEmoji": false,
+    "proactiveIntervalMin": 5,
+    "proactiveIntervalMax": 10
+  }'::jsonb,
   rate_eth_per_min     NUMERIC(18, 8) NOT NULL DEFAULT 0.001,
   is_active            BOOLEAN NOT NULL DEFAULT TRUE,
   total_subscribers    INTEGER NOT NULL DEFAULT 0,
