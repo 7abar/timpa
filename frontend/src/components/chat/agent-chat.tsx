@@ -38,11 +38,10 @@ export function AgentChat({ channel, currentUserId }: AgentChatProps) {
     enabled: true,
   })
 
-  // Poll agent for auto-posts when stream is active
+  // Poll agent for auto-posts when stream is active (5-10s jittered interval)
   useAgentPoll({
     channelId: channel.id,
-    enabled: true,
-    intervalMs: 8000,
+    streamActive: true,
   })
 
   const channelMessages = messages[channel.id] ?? realtimeMessages

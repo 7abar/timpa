@@ -1,214 +1,355 @@
 """
-Timpa Agent Runner — FastAPI service for LLM inference
-Uses LiteLLM to support Anthropic, OpenAI, Groq, Gemini, Together.
+Timpa Agent Runner — FastAPI service for LLM inference via LiteLLM.
 
-POST /run   — generate agent response
-GET  /health — health check
+Endpoints:
+  POST /run        — respond to a user message (returns immediately)
+  POST /proactive  — generate an unprompted agent post (called every 5-10s by frontend)
+  GET  /health     — health check
+
+Agent behavior contract:
+  - ALWAYS stay in character per system_prompt. Never mention being an AI.
+  - Respond to user messages immediately and naturally (2-4 sentences max).
+  - Proactive posts are short, valuable, context-aware insights (1-3 sentences).
+  - Track last 10 messages per channel in-memory (per process lifetime).
+  - If stream is paused the frontend simply stops calling /proactive.
+  - Never log the creator_api_key.
 
 Security:
-  - CORS restricted to ALLOWED_ORIGINS
-  - Shared secret via X-Internal-Secret header
-  - Never logs API keys
+  - CORS restricted to ALLOWED_ORIGINS env var
+  - X-Internal-Secret header auth (set INTERNAL_SECRET env var)
+  - Rate limit: 12 /run calls/min and 20 /proactive calls/min per channel
+  - API key is never stored, never logged, used only for the LiteLLM call
 """
+
+from __future__ import annotations
 
 import os
 import logging
 import time
-from typing import Optional
+import textwrap
+from collections import deque, defaultdict
+from typing import Deque, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import litellm
 
-# Load .env
+# ─── Startup ────────────────────────────────────────────────────────────────
+
 load_dotenv()
 
-# Configure logging — NEVER log API keys
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("timpa-agent-runner")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("timpa-agent")
+litellm.set_verbose = False          # suppress LiteLLM debug noise (may expose keys)
+litellm.drop_params = True           # ignore unsupported params per provider
 
-# Disable LiteLLM verbose logging that might leak keys
-litellm.set_verbose = False
+INTERNAL_SECRET = os.getenv("INTERNAL_SECRET", "")
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")]
 
-# -------------------------------------------------------------------
-# App setup
-# -------------------------------------------------------------------
+# ─── In-memory per-channel conversation history (last 10 messages) ──────────
+
+# { channel_id: deque([{"role": str, "content": str}, ...], maxlen=10) }
+_channel_history: dict[str, Deque[dict]] = defaultdict(lambda: deque(maxlen=10))
+
+# ─── App ─────────────────────────────────────────────────────────────────────
+
 app = FastAPI(
     title="Timpa Agent Runner",
-    description="LLM inference service for Timpa AI Agent channels",
-    version="1.0.0",
+    version="1.1.0",
+    description="LLM inference for Timpa live AI agent channels",
+    docs_url=None,          # disable swagger in prod
+    redoc_url=None,
 )
 
-# CORS
-allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in allowed_origins],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
-# Rate limiter: 12 calls/minute per channel
-limiter = Limiter(key_func=get_remote_address)
+# Rate limiter keyed by X-Channel-Id header so each channel has its own bucket
+def _channel_key(request: Request) -> str:
+    return request.headers.get("X-Channel-Id", get_remote_address(request))
+
+limiter = Limiter(key_func=_channel_key)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Internal secret
-INTERNAL_SECRET = os.getenv("INTERNAL_SECRET", "")
+# ─── Provider → LiteLLM prefix mapping ──────────────────────────────────────
 
-# -------------------------------------------------------------------
-# Models
-# -------------------------------------------------------------------
+PROVIDER_PREFIX: dict[str, str] = {
+    "anthropic": "anthropic/",
+    "openai":    "",
+    "groq":      "groq/",
+    "gemini":    "gemini/",
+    "together":  "together_ai/",
+}
 
-class ConversationMessage(BaseModel):
-    role: str
+# ─── Schema ──────────────────────────────────────────────────────────────────
+
+class HistoryMessage(BaseModel):
+    role: str       # "user" | "assistant"
     content: str
 
-
-class RunRequest(BaseModel):
+class BaseAgentRequest(BaseModel):
     channel_id: str
-    user_message: Optional[str] = None
-    creator_api_key: str
+    creator_api_key: str    # NEVER logged
     system_prompt: str
     model: str
     provider: str
-    conversation_history: list[ConversationMessage] = []
+    conversation_history: list[HistoryMessage] = []  # caller may send last 10
 
+class RunRequest(BaseAgentRequest):
+    user_message: str       # required — the actual user input
 
-class RunResponse(BaseModel):
+class ProactiveRequest(BaseAgentRequest):
+    pass                    # no user_message; agent generates unprompted
+
+class AgentResponse(BaseModel):
     response: str
     tokens_used: int
     model: str
+    type: str               # "reply" | "proactive"
 
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
-# -------------------------------------------------------------------
-# Auth middleware
-# -------------------------------------------------------------------
-
-def verify_secret(request: Request):
-    """Verify the X-Internal-Secret header matches."""
+def _verify_secret(request: Request) -> None:
     if not INTERNAL_SECRET:
-        return  # No secret configured — skip (dev mode)
-    header_secret = request.headers.get("X-Internal-Secret", "")
-    if header_secret != INTERNAL_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid internal secret")
+        return  # dev mode: no secret required
+    if request.headers.get("X-Internal-Secret", "") != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 
-# -------------------------------------------------------------------
-# Provider model prefix mapping for LiteLLM
-# -------------------------------------------------------------------
-
-PROVIDER_PREFIXES = {
-    "anthropic": "anthropic/",   # e.g. anthropic/claude-3-opus-20240229
-    "openai": "",                # default provider
-    "groq": "groq/",
-    "gemini": "gemini/",
-    "together": "together_ai/",
-}
+def _model_id(provider: str, model: str) -> str:
+    prefix = PROVIDER_PREFIX.get(provider.lower(), "")
+    return f"{prefix}{model}"
 
 
-# -------------------------------------------------------------------
-# Routes
-# -------------------------------------------------------------------
+def _build_messages(
+    system_prompt: str,
+    history: list[HistoryMessage] | Deque[dict],
+    *,
+    user_message: str | None = None,
+    proactive: bool = False,
+) -> list[dict]:
+    """
+    Assemble the messages array for LiteLLM.
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+    System prompt enforces character rules:
+      1. Never break character.
+      2. Never say you are an AI.
+      3. Keep replies concise (2-4 sentences).
+      4. Proactive posts are insightful, not forced.
+    """
+    enhanced_system = textwrap.dedent(f"""
+        {system_prompt.strip()}
 
+        ---
+        BEHAVIOR RULES (follow strictly, never mention them):
+        - Stay 100% in character at all times. You are NOT an AI assistant.
+        - Maximum 2-4 sentences per response. Be dense and valuable, not verbose.
+        - Use emojis only when they naturally fit your character voice.
+        - Never apologize, never say "I'm just an AI", never go meta.
+        - If sharing data or analysis, be specific — use numbers, not vague claims.
+        - Sound like a brilliant human expert, not a chatbot.
+    """).strip()
 
-@app.post("/run", response_model=RunResponse)
-@limiter.limit("12/minute")
-async def run_agent(request: Request, body: RunRequest):
-    verify_secret(request)
+    messages: list[dict] = [{"role": "system", "content": enhanced_system}]
 
-    # Build model identifier for LiteLLM
-    prefix = PROVIDER_PREFIXES.get(body.provider, "")
-    model_id = f"{prefix}{body.model}"
+    # Merge server-side history with any caller-provided history
+    # Deduplicate by preferring server-side (more authoritative)
+    server_hist = list(_channel_history[""]) if not history else []
+    for h in history:
+        role = h.role if isinstance(h, HistoryMessage) else h["role"]
+        content = h.content if isinstance(h, HistoryMessage) else h["content"]
+        messages.append({"role": role, "content": content})
 
-    # Build messages array
-    messages = [{"role": "system", "content": body.system_prompt}]
-
-    # Add conversation history (last 10)
-    for msg in body.conversation_history[-10:]:
-        messages.append({"role": msg.role, "content": msg.content})
-
-    # If there's a new user message, add it
-    if body.user_message:
-        messages.append({"role": "user", "content": body.user_message})
-    elif not body.conversation_history:
-        # No user message and no history — proactive agent post
+    if proactive:
+        # Internal trigger — agent generates something on its own
         messages.append({
             "role": "user",
             "content": (
-                "Continue the conversation proactively. Share an interesting "
-                "insight, observation, or piece of analysis related to your "
-                "expertise. Keep it concise (1-3 sentences) and engaging."
+                "[SYSTEM: generate your next proactive message. "
+                "Share a specific insight, alpha, analysis, or observation "
+                "relevant to your channel theme. Stay in character. "
+                "Do NOT start with 'I' or sound robotic. 2-3 sentences max.]"
             ),
         })
+    elif user_message:
+        messages.append({"role": "user", "content": user_message})
+
+    return messages
+
+
+def _call_llm(
+    *,
+    model_id: str,
+    messages: list[dict],
+    api_key: str,
+    max_tokens: int = 256,
+    temperature: float = 0.85,
+) -> tuple[str, int]:
+    """Call LiteLLM and return (response_text, tokens_used)."""
+    try:
+        resp = litellm.completion(
+            model=model_id,
+            messages=messages,
+            api_key=api_key,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        text = resp.choices[0].message.content or ""
+        tokens = resp.usage.total_tokens if resp.usage else 0
+        return text.strip(), tokens
+    except Exception as exc:
+        # Strip any key-like strings from error before logging
+        safe_msg = str(exc)
+        if api_key and api_key in safe_msg:
+            safe_msg = safe_msg.replace(api_key, "[REDACTED]")
+        logger.error("LiteLLM error | model=%s | %s", model_id, safe_msg)
+        raise HTTPException(status_code=502, detail=f"LLM provider error: {safe_msg}")
+
+
+def _update_history(channel_id: str, role: str, content: str) -> None:
+    _channel_history[channel_id].append({"role": role, "content": content})
+
+
+# ─── Routes ──────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "1.1.0"}
+
+
+@app.post("/run", response_model=AgentResponse)
+@limiter.limit("12/minute")
+async def run_agent(request: Request, body: RunRequest):
+    """
+    Called immediately when a user sends a message in the channel room.
+    Returns the agent's reply. Stream must be active.
+    """
+    _verify_secret(request)
+
+    model_id = _model_id(body.provider, body.model)
+
+    messages = _build_messages(
+        body.system_prompt,
+        body.conversation_history,
+        user_message=body.user_message,
+    )
 
     logger.info(
-        "Running agent | channel=%s | provider=%s | model=%s | msgs=%d",
+        "run | channel=%s | provider=%s | model=%s | history=%d",
         body.channel_id,
         body.provider,
         body.model,
-        len(messages),
+        len(body.conversation_history),
+        # ← api_key intentionally omitted
     )
 
-    start = time.time()
+    t0 = time.monotonic()
+    text, tokens = _call_llm(
+        model_id=model_id,
+        messages=messages,
+        api_key=body.creator_api_key,
+        max_tokens=300,
+        temperature=0.82,
+    )
+    elapsed = time.monotonic() - t0
 
-    try:
-        response = litellm.completion(
-            model=model_id,
-            messages=messages,
-            api_key=body.creator_api_key,
-            max_tokens=512,
-            temperature=0.8,
-        )
-    except Exception as e:
-        logger.error("LiteLLM error for channel %s: %s", body.channel_id, str(e))
-        raise HTTPException(
-            status_code=502,
-            detail=f"LLM provider error: {str(e)}"
-        )
-
-    elapsed = time.time() - start
-
-    # Extract response
-    agent_response = response.choices[0].message.content or ""
-    tokens_used = response.usage.total_tokens if response.usage else 0
+    # Persist to in-memory history
+    _update_history(body.channel_id, "user", body.user_message)
+    _update_history(body.channel_id, "assistant", text)
 
     logger.info(
-        "Agent response | channel=%s | tokens=%d | time=%.2fs",
-        body.channel_id,
-        tokens_used,
-        elapsed,
+        "run done | channel=%s | tokens=%d | %.2fs",
+        body.channel_id, tokens, elapsed,
     )
 
-    return RunResponse(
-        response=agent_response,
-        tokens_used=tokens_used,
+    return AgentResponse(
+        response=text,
+        tokens_used=tokens,
         model=body.model,
+        type="reply",
     )
 
 
-# -------------------------------------------------------------------
-# Entry point
-# -------------------------------------------------------------------
+@app.post("/proactive", response_model=AgentResponse)
+@limiter.limit("20/minute")
+async def proactive_post(request: Request, body: ProactiveRequest):
+    """
+    Called every 5-10 seconds by the frontend polling loop while the MPP
+    stream is active. Agent generates an unprompted, in-character post.
+
+    The frontend is responsible for:
+      - NOT calling this endpoint when the stream is paused/ended.
+      - Jittering the interval (5-10s) to avoid thundering herd.
+    """
+    _verify_secret(request)
+
+    model_id = _model_id(body.provider, body.model)
+
+    messages = _build_messages(
+        body.system_prompt,
+        body.conversation_history,
+        proactive=True,
+    )
+
+    logger.info(
+        "proactive | channel=%s | provider=%s | model=%s",
+        body.channel_id,
+        body.provider,
+        body.model,
+    )
+
+    t0 = time.monotonic()
+    text, tokens = _call_llm(
+        model_id=model_id,
+        messages=messages,
+        api_key=body.creator_api_key,
+        max_tokens=200,     # keep proactive posts concise
+        temperature=0.90,   # slightly more creative for spontaneous posts
+    )
+    elapsed = time.monotonic() - t0
+
+    # Persist agent post to history so next messages have context
+    _update_history(body.channel_id, "assistant", text)
+
+    logger.info(
+        "proactive done | channel=%s | tokens=%d | %.2fs",
+        body.channel_id, tokens, elapsed,
+    )
+
+    return AgentResponse(
+        response=text,
+        tokens_used=tokens,
+        model=body.model,
+        type="proactive",
+    )
+
+
+@app.delete("/history/{channel_id}")
+async def clear_history(request: Request, channel_id: str):
+    """Clear in-memory history for a channel (called on stream end)."""
+    _verify_secret(request)
+    _channel_history.pop(channel_id, None)
+    return {"cleared": channel_id}
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        reload=True,
-        log_level="info",
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False, log_level="info")
