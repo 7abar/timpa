@@ -1,244 +1,316 @@
-/**
- * Channel Server Actions
- */
 'use server'
 
-import { createSupabaseServerClient, createSupabaseAdminClient } from '@/lib/supabase/server'
-import { slugify } from '@/lib/utils'
-
 /**
- * createChannel — validates input, encrypts API key, inserts channel
+ * Server Actions — Channel CRUD + stream lifecycle
+ *
+ * Security:
+ *  - API keys are NEVER stored plaintext; encrypted via Supabase pgcrypto
+ *  - decrypt_api_key RPC only runs server-side with service role key
+ *  - All mutations verify session ownership before proceeding
  */
+
+import { revalidatePath } from 'next/cache'
+import { redirect } from 'next/navigation'
+import { cookies } from 'next/headers'
+import { createServerClient } from '@supabase/ssr'
+import { DEFAULT_AGENT_CONFIG } from '@/types'
+import type { AgentConfig, CreateChannelForm } from '@/types'
+
+// ── Supabase helpers ────────────────────────────────────────────────────────
+
+async function getSessionClient() {
+  const cookieStore = await cookies()
+  return createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll: () => cookieStore.getAll(),
+        setAll: (cs) => cs.forEach(({ name, value, options }) =>
+          cookieStore.set(name, value, options)
+        ),
+      },
+    }
+  )
+}
+
+function getServiceClient() {
+  return createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { cookies: { getAll: () => [], setAll: () => {} } }
+  )
+}
+
+function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .slice(0, 60)
+}
+
+// ── createChannel ────────────────────────────────────────────────────────────
+
 export async function createChannel(formData: FormData) {
-  const supabase = await createSupabaseServerClient()
+  const supabase = await getSessionClient()
   const { data: { user } } = await supabase.auth.getUser()
 
-  if (!user) return { error: 'Not authenticated' }
+  if (!user) {
+    return { error: 'Not authenticated' }
+  }
 
-  const name = formData.get('name') as string
-  const slug = slugify(formData.get('slug') as string || name)
-  const bio = formData.get('bio') as string
-  const provider = formData.get('provider') as string
-  const model = formData.get('model') as string
-  const apiKey = formData.get('apiKey') as string
-  const systemPrompt = formData.get('systemPrompt') as string
-  const personalityTemplate = formData.get('personalityTemplate') as string || null
+  // Extract + validate fields
+  const name          = (formData.get('name') as string)?.trim()
+  const bio           = (formData.get('bio') as string)?.trim() ?? ''
+  const provider      = formData.get('provider') as string
+  const model         = formData.get('model') as string
+  const apiKey        = (formData.get('apiKey') as string)?.trim()
+  const systemPrompt  = (formData.get('systemPrompt') as string)?.trim()
   const rateEthPerMin = parseFloat(formData.get('rateEthPerMin') as string)
+  const personalityTemplate = formData.get('personalityTemplate') as string | null
+  const agentConfigRaw      = formData.get('agentConfig') as string | null
 
-  // Validate required fields
   if (!name || !provider || !model || !apiKey || !systemPrompt) {
-    return { error: 'Missing required fields' }
+    return { error: 'All required fields must be filled' }
   }
 
-  if (rateEthPerMin < 0.001 || rateEthPerMin > 0.1) {
-    return { error: 'Rate must be between 0.001 and 0.1 ETH/min' }
+  if (isNaN(rateEthPerMin) || rateEthPerMin < 0.0001 || rateEthPerMin > 1) {
+    return { error: 'Rate must be between 0.0001 and 1 ETH/min' }
   }
 
-  // Check slug uniqueness
-  const { data: existingSlug } = await supabase
+  if (systemPrompt.length < 20) {
+    return { error: 'System prompt must be at least 20 characters' }
+  }
+
+  // Parse agentConfig (sent as JSON string from client form)
+  let agentConfig: AgentConfig = DEFAULT_AGENT_CONFIG
+  if (agentConfigRaw) {
+    try {
+      agentConfig = { ...DEFAULT_AGENT_CONFIG, ...JSON.parse(agentConfigRaw) }
+    } catch {
+      // Use defaults if parse fails
+    }
+  }
+
+  // Generate unique slug
+  const baseSlug = slugify(name)
+  const service  = getServiceClient()
+
+  // Check slug uniqueness, append random suffix if taken
+  let slug = baseSlug
+  const { count } = await service
     .from('channels')
-    .select('id')
+    .select('id', { count: 'exact', head: true })
     .eq('slug', slug)
-    .maybeSingle()
 
-  if (existingSlug) {
-    return { error: 'Channel slug already taken. Try a different name.' }
+  if (count && count > 0) {
+    slug = `${baseSlug}-${Math.random().toString(36).slice(2, 6)}`
   }
 
-  // Encrypt the API key via pgcrypto helper function
-  const admin = await createSupabaseAdminClient()
-  const { data: encryptedKey, error: encryptError } = await admin
-    .rpc('encrypt_api_key', { key_text: apiKey })
+  // Encrypt API key via Supabase pgcrypto RPC
+  const { data: encryptedKey, error: encErr } = await service
+    .rpc('encrypt_api_key', { key: apiKey })
 
-  if (encryptError || !encryptedKey) {
-    console.error('Encryption error:', encryptError?.message)
-    return { error: 'Failed to encrypt API key. Contact support.' }
+  if (encErr || !encryptedKey) {
+    console.error('encrypt_api_key RPC error:', encErr?.message)
+    return { error: 'Failed to encrypt API key — check pgcrypto setup' }
   }
 
   // Insert channel
-  const { error: insertError } = await supabase
+  const { data: channel, error: insertErr } = await service
     .from('channels')
     .insert({
-      creator_id: user.id,
+      creator_id:           user.id,
       name,
       slug,
-      bio: bio || null,
+      bio,
       provider,
       model,
-      system_prompt: systemPrompt,
-      encrypted_api_key: encryptedKey as string,
-      personality_template: personalityTemplate,
-      rate_eth_per_min: rateEthPerMin,
+      system_prompt:        systemPrompt,
+      encrypted_api_key:    encryptedKey,
+      personality_template: personalityTemplate || null,
+      agent_config:         agentConfig,
+      rate_eth_per_min:     rateEthPerMin,
+      is_active:            true,
     })
+    .select('slug')
+    .single()
 
-  if (insertError) {
-    console.error('Insert error:', insertError.message)
-    return { error: insertError.message }
+  if (insertErr) {
+    console.error('Channel insert error:', insertErr.message)
+    return { error: insertErr.message }
   }
 
-  return { success: true, slug }
+  revalidatePath('/explore')
+  revalidatePath('/profile')
+  redirect(`/channel/${channel.slug}`)
 }
 
-/**
- * updateChannel — creator-only update
- */
-export async function updateChannel(
-  channelId: string,
-  data: {
-    name?: string
-    bio?: string
-    systemPrompt?: string
-    personalityTemplate?: string | null
-    rateEthPerMin?: number
-    isActive?: boolean
-  }
-) {
-  const supabase = await createSupabaseServerClient()
-  const { data: { user } } = await supabase.auth.getUser()
+// ── updateChannel ────────────────────────────────────────────────────────────
 
+export async function updateChannel(channelId: string, formData: FormData) {
+  const supabase = await getSessionClient()
+  const { data: { user } } = await supabase.auth.getUser()
   if (!user) return { error: 'Not authenticated' }
 
-  const updates: Record<string, unknown> = {}
-  if (data.name !== undefined) updates.name = data.name
-  if (data.bio !== undefined) updates.bio = data.bio
-  if (data.systemPrompt !== undefined) updates.system_prompt = data.systemPrompt
-  if (data.personalityTemplate !== undefined) updates.personality_template = data.personalityTemplate
-  if (data.rateEthPerMin !== undefined) updates.rate_eth_per_min = data.rateEthPerMin
-  if (data.isActive !== undefined) updates.is_active = data.isActive
+  const service = getServiceClient()
 
-  const { error } = await supabase
+  // Verify ownership
+  const { data: existing } = await service
+    .from('channels')
+    .select('creator_id, slug')
+    .eq('id', channelId)
+    .single()
+
+  if (!existing || existing.creator_id !== user.id) {
+    return { error: 'Not authorized' }
+  }
+
+  const updates: Record<string, unknown> = {}
+
+  const name         = formData.get('name') as string | null
+  const bio          = formData.get('bio') as string | null
+  const systemPrompt = formData.get('systemPrompt') as string | null
+  const rateRaw      = formData.get('rateEthPerMin') as string | null
+  const isActiveRaw  = formData.get('isActive') as string | null
+  const agentCfgRaw  = formData.get('agentConfig') as string | null
+  const newApiKey    = formData.get('apiKey') as string | null
+
+  if (name)         updates.name          = name.trim()
+  if (bio !== null) updates.bio           = bio.trim()
+  if (systemPrompt) updates.system_prompt = systemPrompt.trim()
+  if (rateRaw)      updates.rate_eth_per_min = parseFloat(rateRaw)
+  if (isActiveRaw !== null) updates.is_active = isActiveRaw === 'true'
+  if (agentCfgRaw) {
+    try { updates.agent_config = JSON.parse(agentCfgRaw) } catch {}
+  }
+
+  // Re-encrypt API key if provided
+  if (newApiKey?.trim()) {
+    const { data: enc, error: encErr } = await service
+      .rpc('encrypt_api_key', { key: newApiKey.trim() })
+    if (!encErr && enc) updates.encrypted_api_key = enc
+  }
+
+  updates.updated_at = new Date().toISOString()
+
+  const { error } = await service
     .from('channels')
     .update(updates)
     .eq('id', channelId)
-    .eq('creator_id', user.id)  // RLS + explicit check
 
   if (error) return { error: error.message }
+
+  revalidatePath(`/channel/${existing.slug}`)
+  revalidatePath('/profile')
   return { success: true }
 }
 
-/**
- * deleteChannel — soft delete (set is_active = false)
- */
+// ── deleteChannel ────────────────────────────────────────────────────────────
+
 export async function deleteChannel(channelId: string) {
-  const supabase = await createSupabaseServerClient()
+  const supabase = await getSessionClient()
   const { data: { user } } = await supabase.auth.getUser()
-
   if (!user) return { error: 'Not authenticated' }
 
-  const { error } = await supabase
+  const service = getServiceClient()
+
+  const { data: existing } = await service
     .from('channels')
-    .update({ is_active: false })
+    .select('creator_id')
     .eq('id', channelId)
-    .eq('creator_id', user.id)
-
-  if (error) return { error: error.message }
-  return { success: true }
-}
-
-/**
- * startChannelStream — creates a subscription record and returns streamId
- */
-export async function startChannelStream(channelId: string) {
-  const supabase = await createSupabaseServerClient()
-  const { data: { user } } = await supabase.auth.getUser()
-
-  if (!user) return { error: 'Not authenticated' }
-
-  // Check channel exists and is active
-  const { data: channel } = await supabase
-    .from('channels')
-    .select('id, creator_id')
-    .eq('id', channelId)
-    .eq('is_active', true)
     .single()
 
-  if (!channel) return { error: 'Channel not found or inactive' }
+  if (!existing || existing.creator_id !== user.id) {
+    return { error: 'Not authorized' }
+  }
 
-  // Check for existing active subscription
-  const { data: existing } = await supabase
+  // Soft delete: set is_active = false
+  const { error } = await service
+    .from('channels')
+    .update({ is_active: false, updated_at: new Date().toISOString() })
+    .eq('id', channelId)
+
+  if (error) return { error: error.message }
+
+  revalidatePath('/explore')
+  revalidatePath('/profile')
+  return { success: true }
+}
+
+// ── Stream lifecycle ─────────────────────────────────────────────────────────
+
+export async function startChannelStream(channelId: string) {
+  const supabase = await getSessionClient()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return { error: 'Not authenticated' }
+
+  const service = getServiceClient()
+
+  // Check no existing active stream
+  const { data: existing } = await service
     .from('subscriptions')
-    .select('id')
+    .select('id, status')
     .eq('channel_id', channelId)
     .eq('subscriber_id', user.id)
-    .in('status', ['active', 'paused'])
+    .eq('status', 'active')
     .maybeSingle()
 
-  if (existing) {
-    return { error: 'Already subscribed to this channel', subscriptionId: existing.id }
-  }
+  if (existing) return { data: existing }
 
-  // Generate stream ID
-  const streamId = `stream_${channelId}_${Date.now()}`
+  const streamId = `stream_${crypto.randomUUID()}`
 
-  // Create subscription
-  const { data: sub, error } = await supabase
+  const { data, error } = await service
     .from('subscriptions')
     .insert({
-      channel_id: channelId,
+      channel_id:    channelId,
       subscriber_id: user.id,
-      stream_id: streamId,
-      status: 'active',
+      stream_id:     streamId,
+      status:        'active',
+      started_at:    new Date().toISOString(),
     })
-    .select('id')
+    .select()
     .single()
 
   if (error) return { error: error.message }
 
-  // Increment subscriber count via admin client
-  const admin = await createSupabaseAdminClient()
-  const { data: ch } = await admin
-    .from('channels')
-    .select('total_subscribers')
-    .eq('id', channelId)
-    .single()
+  // Increment subscriber count
+  await service.rpc('increment_subscribers', { channel_id: channelId })
 
-  if (ch) {
-    await admin
-      .from('channels')
-      .update({ total_subscribers: ((ch as any).total_subscribers ?? 0) + 1 })
-      .eq('id', channelId)
-  }
-
-  return { success: true, subscriptionId: sub.id, streamId }
+  revalidatePath(`/channel/${channelId}/room`)
+  return { data }
 }
 
-/**
- * pauseChannelStream — sets subscription status to paused
- */
 export async function pauseChannelStream(subscriptionId: string) {
-  const supabase = await createSupabaseServerClient()
+  const supabase = await getSessionClient()
   const { data: { user } } = await supabase.auth.getUser()
-
   if (!user) return { error: 'Not authenticated' }
 
-  const { error } = await supabase
+  const service = getServiceClient()
+
+  const { error } = await service
     .from('subscriptions')
-    .update({
-      status: 'paused' as const,
-      paused_at: new Date().toISOString(),
-    })
+    .update({ status: 'paused', paused_at: new Date().toISOString() })
     .eq('id', subscriptionId)
-    .eq('subscriber_id', user.id)
+    .eq('subscriber_id', user.id)   // ownership check
 
   if (error) return { error: error.message }
   return { success: true }
 }
 
-/**
- * resumeChannelStream — sets subscription status back to active
- */
 export async function resumeChannelStream(subscriptionId: string) {
-  const supabase = await createSupabaseServerClient()
+  const supabase = await getSessionClient()
   const { data: { user } } = await supabase.auth.getUser()
-
   if (!user) return { error: 'Not authenticated' }
 
-  const { error } = await supabase
+  const service = getServiceClient()
+
+  const { error } = await service
     .from('subscriptions')
-    .update({
-      status: 'active' as const,
-      paused_at: null,
-    })
+    .update({ status: 'active', paused_at: null })
     .eq('id', subscriptionId)
     .eq('subscriber_id', user.id)
 
@@ -246,21 +318,19 @@ export async function resumeChannelStream(subscriptionId: string) {
   return { success: true }
 }
 
-/**
- * endChannelStream — finalizes the subscription, updates revenue
- */
 export async function endChannelStream(
   subscriptionId: string,
-  totalCost: number,
+  totalCostEth: number,
   totalTokens: number
 ) {
-  const supabase = await createSupabaseServerClient()
+  const supabase = await getSessionClient()
   const { data: { user } } = await supabase.auth.getUser()
-
   if (!user) return { error: 'Not authenticated' }
 
-  // Get subscription to find channel
-  const { data: sub } = await supabase
+  const service = getServiceClient()
+
+  // Fetch sub to get channel_id for revenue update
+  const { data: sub } = await service
     .from('subscriptions')
     .select('channel_id')
     .eq('id', subscriptionId)
@@ -269,49 +339,33 @@ export async function endChannelStream(
 
   if (!sub) return { error: 'Subscription not found' }
 
-  // Update subscription
-  const { error: subError } = await supabase
+  const { error } = await service
     .from('subscriptions')
     .update({
-      status: 'ended' as const,
-      ended_at: new Date().toISOString(),
-      total_cost_eth: totalCost,
-      total_tokens: totalTokens,
+      status:         'ended',
+      ended_at:       new Date().toISOString(),
+      total_cost_eth: totalCostEth,
+      total_tokens:   totalTokens,
     })
     .eq('id', subscriptionId)
     .eq('subscriber_id', user.id)
 
-  if (subError) return { error: subError.message }
+  if (error) return { error: error.message }
 
-  // Update channel total revenue and creator earnings
-  const admin = await createSupabaseAdminClient()
+  // Update channel total_revenue
+  await service.rpc('add_channel_revenue', {
+    channel_id: sub.channel_id,
+    amount:     totalCostEth,
+  })
 
-  const { data: channel } = await admin
-    .from('channels')
-    .select('total_revenue, creator_id')
-    .eq('id', sub.channel_id)
-    .single()
+  // Clear agent runner in-memory history
+  try {
+    await fetch(`${process.env.AGENT_RUNNER_URL}/history/${sub.channel_id}`, {
+      method: 'DELETE',
+      headers: { 'X-Internal-Secret': process.env.INTERNAL_SECRET ?? '' },
+    })
+  } catch { /* non-critical */ }
 
-  if (channel) {
-    await admin
-      .from('channels')
-      .update({ total_revenue: (channel.total_revenue ?? 0) + totalCost })
-      .eq('id', sub.channel_id)
-
-    // Update creator earnings
-    const { data: profile } = await admin
-      .from('profiles')
-      .select('total_earnings')
-      .eq('id', channel.creator_id)
-      .single()
-
-    if (profile) {
-      await admin
-        .from('profiles')
-        .update({ total_earnings: (profile.total_earnings ?? 0) + totalCost })
-        .eq('id', channel.creator_id)
-    }
-  }
-
+  revalidatePath(`/channel/${sub.channel_id}`)
   return { success: true }
 }
